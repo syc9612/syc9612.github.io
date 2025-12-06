@@ -1,87 +1,98 @@
 use std::fs;
 use std::path::{Path};
-
+use anyhow::{Result, Context, anyhow};
 use pulldown_cmark::{Parser, Options, html};
 
-fn main() 
+fn main() -> Result<()> 
 {
-    //경로 하드코딩
-    let input_path = "./markdown_files/new/";
-    let output_path = "./html_files/";
-    
-    //입력받은 경로에서 iter로 돌면서 찾음.
-    fs::read_dir(input_path)
-        .expect("Cannot read input directory")
+    let input_path = "../markdown_files/new/";
+    let output_path = "../html_files/";
+
+    fs::create_dir_all("../markdown_files/save/")
+        .context("Failed to create save directory")?;
+
+    fs::create_dir_all(output_path)
+        .context("Failed to create output directory")?;
+
+    fs::read_dir(input_path)?
         .filter_map(|e| e.ok())
         .map(|e| e.path())
-        .filter(|p| p.extension().map(|ext| ext == "md").unwrap_or(false))
-        .for_each(|path|
-        {
-        print!("Doing Converting...");
-        if convert_to_html(&path, output_path) == false
-        {
-            panic!("can not convert_to_html");
-        }
-        move_to_save(&path);
-        });
+        .filter(|p| p.is_file())
+        .filter(|p| is_markdown(p))
+        .try_for_each(|path| -> Result<()> {
+            convert_to_html(&path, output_path)?;
+            move_to_save(&path)?;
+            Ok::<(), anyhow::Error>(()) 
+        })?;
+
+    Ok(())
 }
 
-fn convert_to_html(input_file: &Path, output_dir: &str) -> bool
-{
-    //TO-DO: Converting 하기 전에 html로 만들어지지 않았는지 검사해보자.
-    let file_name = input_file.file_stem().unwrap().to_string_lossy();
-    let output_path = format!("{}/{}.html", output_dir, file_name);
+fn is_markdown(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.eq_ignore_ascii_case("md"))
+        .unwrap_or(false)
+}
 
-    if Path::new(&output_path).exists() 
-    {
-        println!("Already converted : {:?}", output_path);
-        return false;
+fn convert_to_html(input_file: &Path, output_dir: &str) -> Result<()> {
+    // 파일명 안전하게 얻기
+    let file_stem = input_file
+        .file_stem()
+        .and_then(|x| x.to_str())
+        .ok_or_else(|| anyhow!("Invalid UTF-8 filename"))?;
+
+    let output_path = format!("{}/{}.html", output_dir, file_stem);
+
+    // 이미 만들어진 HTML 파일이 있으면 변환하지 않음
+    if Path::new(&output_path).exists() {
+        return Err(anyhow!("HTML already exists: {}", output_path));
     }
 
-    let markdown = 
-    match fs::read_to_string(input_file) 
-    {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("Fail to read {:?}: {}", input_file, e);
-            return false;
-        }
-    };
+    // Markdown 읽기
+    let markdown = fs::read_to_string(input_file)
+        .with_context(|| format!("Fail to read {:?}", input_file))?;
 
+    // 변환 옵션
     let mut options = Options::empty();
     options.insert(Options::ENABLE_TABLES);
     options.insert(Options::ENABLE_FOOTNOTES);
     options.insert(Options::ENABLE_STRIKETHROUGH);
 
+    // Markdown → HTML 변환
     let parser = Parser::new_ext(&markdown, options);
 
     let mut html_output = String::new();
     html::push_html(&mut html_output, parser);
 
-
     // HTML 파일 쓰기
-    if let Err(e) = fs::write(&output_path, html_output) {
-        eprintln!("Fail to write {}: {}", output_path, e);
-        return false;
-    }
+    fs::write(&output_path, html_output)
+        .with_context(|| format!("Fail to write {}", output_path))?;
 
     println!("Done: {}", output_path);
 
-    true
+    Ok(())
 }
 
-fn move_to_save(path: &Path)
-{
-    let file_name = path.file_name().unwrap().to_string_lossy();
-    let dst = format!("{}/{}", "./markdown_files/save/", file_name);
+fn move_to_save(path: &Path) -> Result<()> {
+    let file_name = path
+        .file_name()
+        .and_then(|x| x.to_str())
+        .ok_or_else(|| anyhow!("Invalid file name"))?;
 
-    if let Err(e) = std::fs::rename(&path, &dst) 
-    {
-        eprintln!("Rename failed, trying copy-remove: {e}");
+    let dst = format!("../markdown_files/save/{}", file_name);
 
-        std::fs::copy(&path, &dst).unwrap();
-        std::fs::remove_file(&path).unwrap();
+    // rename → 실패하면 copy/remove fallback
+    if let Err(e) = fs::rename(path, &dst) {
+        eprintln!("Rename failed ({e}), trying copy-remove fallback");
+
+        fs::copy(path, &dst)
+            .with_context(|| format!("copy failed {:?}", path))?;
+
+        fs::remove_file(path)
+            .with_context(|| format!("remove failed {:?}", path))?;
     }
 
-    println!("Moved to {dst}");
+    println!("Moved to {}", dst);
+    Ok(())
 }
