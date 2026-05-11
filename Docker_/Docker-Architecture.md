@@ -417,4 +417,3 @@ Docker Desktop
 - 실습 링크를 각 장 상단에 둔다.
 - Docker Desktop과 Linux Docker 차이를 필요한 곳에서 명시한다.
 - 이지레이어 관련 내용은 packet path, 빌드 재현성, 권한 모델, 성능 튜닝 관점으로 연결한다.
-

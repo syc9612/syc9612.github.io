@@ -276,4 +276,3 @@ Docker의 내부 구조를 네트워크, 파일 시스템, 프로세스 격리, 
 3. 3장 실습에 `depends_on`과 healthcheck 관계 보강
 4. 5장 `OverlayFS와 이미지 레이어` 작성
 5. 이지레이어의 실제 빌드 방식 확인 후 Compose 예시 구체화
-
