@@ -43,6 +43,11 @@ Docker의 내부 구조를 네트워크, 파일 시스템, 프로세스 격리, 
 - `practices/01-docker-network-packet-flow.md`
 - `practices/02-veth-bridge-iptables.md`
 - `practices/03-docker-compose-easylayer.md`
+- `practices/04-container-pid-namespace.md`
+- `practices/05-overlayfs-image-layers.md`
+- `practices/06-docker-to-kubernetes.md`
+- `practices/07-packet-processing-docker.md`
+- `practices/08-docker-security.md`
 
 ## 완료된 섹션
 
@@ -125,85 +130,165 @@ Docker의 내부 구조를 네트워크, 파일 시스템, 프로세스 격리, 
 - device, hugepage 예시
 - CPU pinning 고려
 - healthcheck 예시
+- `depends_on` 짧은 문법과 `condition: service_healthy` 관계 보강
+- one-shot job에서 `condition: service_completed_successfully`를 쓰는 예시 추가
 - 운영에 가까운 검증 checklist
-
-## 남은 작업
 
 ### 4장. Container PID namespace 내부
 
-예정 내용:
+개념 문서:
 
-- PID namespace 기본 구조
-- 컨테이너 내부 PID 1의 의미
-- signal 처리
-- zombie process 회수
-- `docker run --init`
-- `docker top`
-- `nsenter -p`
-- `--pid=host`의 장단점
+- PID namespace 기본 구조와 host PID/container PID 차이 정리
+- 컨테이너 내부 PID 1의 의미와 컨테이너 생명주기 연결
+- `docker stop`의 signal 전달 흐름 설명
+- shell wrapper, exec form, `exec` 사용 기준 정리
+- zombie process와 child process 회수 책임 설명
+- `docker run --init`, Compose `init: true` 역할 정리
+- `docker top`, `docker exec`, `nsenter`, `/proc/<pid>/ns/pid` 관찰 도구 정리
+- `--pid=host`, `--pid=container:<id>`의 장단점 설명
 
-예상 실습 파일:
+실습 문서:
 
 - `practices/04-container-pid-namespace.md`
 
+실습 내용:
+
+- host PID와 container PID 비교
+- PID namespace inode 확인
+- `docker top`과 `docker exec ps` 관점 차이 확인
+- `nsenter`로 PID namespace 진입
+- PID 1 종료와 컨테이너 생명주기 확인
+- `docker stop`과 `SIGTERM` 처리 확인
+- `--init`으로 작은 init 프로세스 확인
+- zombie process 관찰
+- `--pid=host`, `--pid=container:<id>` 비교
+- Troubleshooting과 정리 명령 추가
+
 ### 5장. OverlayFS와 이미지 레이어
 
-예정 내용:
+개념 문서:
 
-- 이미지 layer와 container writable layer
-- copy-on-write
-- `lowerdir`, `upperdir`, `workdir`, `merged`
-- Dockerfile 명령과 layer 관계
-- 빌드 캐시와 이미지 크기 최적화
-- 이지레이어 빌드 이미지에서 multi-stage build와 layer 최적화 연결
+- 이미지 layer와 container writable layer 구분
+- OverlayFS의 `lowerdir`, `upperdir`, `workdir`, `merged` 역할 정리
+- copy-on-write, copy-up, whiteout 흐름 설명
+- Dockerfile 명령과 layer/cache 관계 정리
+- build context, `.dockerignore`, multi-stage build 기준 정리
+- 이지레이어 빌드 이미지에서 runtime image 분리와 layer 최적화 연결
 
-예상 실습 파일:
+실습 문서:
 
 - `practices/05-overlayfs-image-layers.md`
 
+실습 내용:
+
+- storage driver 확인
+- 실습용 Dockerfile 작성과 이미지 빌드
+- `docker image history`, `docker image inspect`로 layer 확인
+- 소스 변경 후 build cache invalidation 확인
+- `docker inspect`로 `GraphDriver.Data` 확인
+- `UpperDir`, `MergedDir` 관찰
+- `docker diff`로 copy-on-write 변경사항 확인
+- 수정, 삭제, 추가 파일과 whiteout 관찰
+- volume/bind mount와 writable layer 차이 정리
+- 이지레이어 multi-stage build 최적화 기준 추가
+- Troubleshooting과 정리 명령 추가
+
 ### 6장. Kubernetes까지 연결
 
-예정 내용:
+개념 문서:
 
-- Docker Compose와 Kubernetes 리소스 대응
-- Pod, Deployment, Service, ConfigMap, Secret, Volume
-- Docker bridge와 Kubernetes CNI 비교
-- kube-proxy, iptables/IPVS 개념 연결
-- 이지레이어를 Kubernetes로 옮길 때 고려할 host network, capability, device plugin, DaemonSet 구조
+- Docker Compose와 Kubernetes 리소스 대응 정리
+- Pod와 workload controller, Deployment, DaemonSet, StatefulSet, Job 역할 구분
+- Kubernetes runtime과 CRI, Docker Engine 직접 의존성 차이 설명
+- Docker bridge와 Kubernetes CNI, Pod IP, Service, EndpointSlice, kube-proxy data path 비교
+- ConfigMap, Secret, Volume, `hostPath` 사용 기준 정리
+- Compose `healthcheck`와 Kubernetes `startupProbe`, `readinessProbe`, `livenessProbe` 차이 정리
+- 이지레이어를 Kubernetes로 옮길 때 고려할 host network, capability, device plugin, hugepage, DaemonSet 구조 정리
+- 공식 Kubernetes 문서 reference 섹션 추가
 
-예상 실습 파일:
+실습 문서:
 
 - `practices/06-docker-to-kubernetes.md`
 
+실습 내용:
+
+- Compose service와 Kubernetes 리소스 대응 확인
+- 실습 namespace 생성
+- ConfigMap과 Secret 생성
+- `nginx` 기반 control API 샘플 Deployment와 Service 적용
+- Pod, Service, EndpointSlice 관찰
+- Service DNS와 `kubectl port-forward` 접근 확인
+- probe 상태 확인
+- 실제 이지레이어 control API manifest로 바꿀 때 수정할 항목 정리
+- DaemonSet, `hostNetwork`, `securityContext`, `hostPath` 템플릿 추가
+- CNI, kube-proxy, Service data path 확인 명령 추가
+- Troubleshooting, 정리 명령, 공식 reference 추가
+
 ### 7장. Packet processing 시스템에서 Docker 쓰는 방식
 
-예정 내용:
+개념 문서:
 
-- bridge, host, macvlan, ipvlan 비교
-- DPDK, AF_XDP, raw socket, pcap 계열 구분
-- NIC 접근 방식
-- hugepage, CPU pinning, NUMA, IRQ affinity
-- 이지레이어에 가장 직접적으로 연결되는 장
+- control plane과 packet data path 분리 기준 정리
+- bridge, host, macvlan, ipvlan, `none` network mode 비교
+- Docker bridge NAT/firewall rule과 host/macvlan/ipvlan의 차이 설명
+- 일반 socket, raw socket/libpcap, TUN/TAP, AF_XDP, DPDK packet I/O 방식 구분
+- capability, device mount, hugepage, VFIO, BPF/XDP 권한 기준 정리
+- CPU pinning, NUMA locality, IRQ affinity, RSS/queue, logging 성능 튜닝 축 정리
+- 이지레이어 packet I/O 방식 확인 질문과 설계 영향 정리
+- 공식 Docker, Linux kernel, DPDK reference 섹션 추가
 
-예상 실습 파일:
+실습 문서:
 
 - `practices/07-packet-processing-docker.md`
 
+실습 내용:
+
+- 이지레이어 packet I/O 방식 분류 질문 정리
+- host NIC, route, CPU, NUMA, IRQ 정보 확인 명령 추가
+- bridge network 경로와 Docker NAT/firewall rule 확인
+- host network 동작과 Compose 예시 정리
+- macvlan/ipvlan 설계 예시와 주의점 정리
+- raw socket `NET_RAW` capability 확인 예시 추가
+- TUN/TAP, `NET_ADMIN` device/capability 템플릿 추가
+- AF_XDP host 점검 항목과 Compose 템플릿 추가
+- DPDK hugepage, PCI driver, VFIO, CPU/NUMA 점검 항목 추가
+- 이지레이어 Compose 설계안과 Kubernetes DaemonSet 연결 예시 추가
+- Troubleshooting, 정리 명령, 공식 reference 추가
+
 ### 8장. Docker 보안
 
-예정 내용:
+개념 문서:
 
-- capability 최소화
-- seccomp profile
-- rootless Docker
-- AppArmor/SELinux
-- Docker socket mount 위험
-- `privileged: true`의 위험과 대안
-- 이지레이어에서 필요한 권한을 최소화하는 기준
+- Docker 기본 보안 모델과 daemon/socket 권한 구조 정리
+- capability 최소화와 `cap_drop: [ALL]`에서 필요한 권한만 더하는 기준 정리
+- seccomp 기본 profile, `seccomp=unconfined` 사용 주의 정리
+- AppArmor와 SELinux 역할, profile/label 차이 정리
+- user namespace remap, rootless Docker, non-root container user 차이 정리
+- Docker socket mount, `privileged: true`, host root filesystem mount 위험 정리
+- 이지레이어 control API, raw capture, AF_XDP/eBPF, DPDK/VFIO별 보안 설계 기준 정리
+- hardened Compose 예시와 공식 reference 섹션 추가
 
-예상 실습 파일:
+실습 문서:
 
 - `practices/08-docker-security.md`
+
+실습 내용:
+
+- Docker daemon security options 확인
+- 컨테이너 내부 root와 `--user` non-root 실행 비교
+- `/proc/self/status`로 capability와 seccomp 상태 확인
+- raw socket `NET_RAW` capability 최소 부여 예시 추가
+- seccomp 기본 profile과 `seccomp=unconfined` 비교 주의점 정리
+- AppArmor `docker-default` profile 확인
+- SELinux `:z`, `:Z` bind mount label 기준 정리
+- read-only root filesystem과 `tmpfs` 예시 추가
+- Docker socket mount 위험 점검 명령 추가
+- `privileged: true` 대안 템플릿 추가
+- rootless와 userns-remap 확인 명령 정리
+- 이지레이어 hardened Compose 템플릿과 Kubernetes `securityContext` 예시 추가
+- Troubleshooting, 정리 명령, 공식 reference 추가
+
+## 남은 작업
 
 ### 9장. 직접 미니 Docker 만들기
 
@@ -244,12 +329,12 @@ Docker의 내부 구조를 네트워크, 파일 시스템, 프로세스 격리, 
 - 본문은 개념과 판단 기준 중심으로 유지한다.
 - 실제 명령, 실행 결과 예시, 정리 명령은 실습 문서로 분리한다.
 - 실습 문서는 `목표 -> 전제 -> 실행 -> 관찰 -> 정리` 순서로 통일한다.
+- 이후 신규 장에는 참고한 공식 reference 섹션을 추가한다.
 
 ### 기술 정확성 개선
 
 - iptables/nftables 차이는 계속 명시한다.
 - Docker Desktop과 Linux Docker의 차이를 네트워크 실습마다 반복해서 주의시킨다.
-- `depends_on`은 readiness 보장이 아니라 시작 순서 제어라는 점을 3장 실습에 보강할 필요가 있다.
 - `network_mode: host`가 Docker Desktop에서 Linux와 다르게 동작할 수 있다는 점을 추가 설명하면 좋다.
 - capability 예시는 실제 필요한 syscall/작업과 연결해서 더 엄격하게 정리할 필요가 있다.
 
@@ -268,11 +353,16 @@ Docker의 내부 구조를 네트워크, 파일 시스템, 프로세스 격리, 
 - 실습 종료 후 정리 명령을 모든 실습 문서에 통일한다.
 - Linux 전용 명령과 PowerShell 대체 명령을 구분해서 표시한다.
 - 실제 Docker 명령을 실행할 수 있는 환경에서 결과를 검증한 뒤 출력 예시를 보강한다.
+- 5장 OverlayFS 실습은 실제 Linux Docker 환경에서 `UpperDir`, whiteout 출력 예시를 검증한 뒤 보강한다.
+- 6장 Kubernetes 실습은 실제 cluster에서 `kubectl apply`, EndpointSlice, probe 출력 예시를 검증한 뒤 보강한다.
+- 7장 packet processing 실습은 실제 Linux NIC 환경에서 bridge/host/macvlan/ipvlan, raw socket, DPDK/AF_XDP 가능 여부를 검증한 뒤 보강한다.
+- 8장 보안 실습은 실제 Linux Docker 환경에서 seccomp/AppArmor/SELinux/rootless 출력 예시를 검증한 뒤 보강한다.
 
 ## 다음 작업 우선순위
 
-1. 4장 `Container PID namespace 내부` 작성
-2. `practices/04-container-pid-namespace.md` 생성
-3. 3장 실습에 `depends_on`과 healthcheck 관계 보강
-4. 5장 `OverlayFS와 이미지 레이어` 작성
-5. 이지레이어의 실제 빌드 방식 확인 후 Compose 예시 구체화
+1. 이지레이어의 실제 빌드 방식 확인 후 Compose 예시 구체화
+2. 5장 OverlayFS 실습을 실제 Linux Docker 환경에서 검증하고 출력 예시 보강
+3. 6장 Kubernetes 실습을 실제 cluster에서 검증하고 출력 예시 보강
+4. 7장 packet processing 실습을 실제 Linux NIC 환경에서 검증하고 출력 예시 보강
+5. 8장 보안 실습을 실제 Linux Docker 환경에서 검증하고 출력 예시 보강
+6. 9장 `직접 미니 Docker 만들기: unshare, chroot, cgroup` 작성

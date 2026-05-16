@@ -264,11 +264,27 @@ services:
   easylayer:
     image: easylayer:local
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/healthz"]
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/healthz || exit 1"]
       interval: 10s
       timeout: 3s
       retries: 3
       start_period: 10s
+```
+
+확인:
+
+```bash
+docker compose up -d
+docker compose ps
+docker inspect -f '{{json .State.Health}}' easylayer
+```
+
+PowerShell에서는 같은 형식으로 실행할 수 있다.
+
+```powershell
+docker compose up -d
+docker compose ps
+docker inspect -f '{{json .State.Health}}' easylayer
 ```
 
 control API가 없다면 다음 중 하나를 고려한다.
@@ -278,12 +294,82 @@ control API가 없다면 다음 중 하나를 고려한다.
 - metrics endpoint 제공
 - 로그 기반 readiness 판단은 되도록 피하기
 
-## 10. 운영에 가까운 검증 checklist
+주의:
+
+- healthcheck 명령은 이미지 안에 실제로 존재해야 한다. `curl`이 없는 runtime image라면 `wget`, 전용 CLI, 작은 health binary 중 하나를 선택한다.
+- 단순히 process가 떠 있는지 보는 check는 readiness로 부족할 수 있다.
+- packet path 초기화, 설정 파일 로드, NIC/device 준비가 끝난 뒤 성공하도록 check 기준을 잡는다.
+
+## 10. `depends_on`과 readiness 관계
+
+`depends_on`의 짧은 문법은 시작 순서를 표현한다.
+
+```yaml
+services:
+  easylayer:
+    image: easylayer:local
+
+  traffic-generator:
+    image: traffic-generator:local
+    depends_on:
+      - easylayer
+```
+
+이 형태는 `easylayer` 컨테이너를 먼저 시작하지만, `easylayer`가 실제 요청을 처리할 준비가 됐다는 보장은 아니다. readiness가 중요하면 의존 대상에 healthcheck를 두고 long syntax를 사용한다.
+
+```yaml
+services:
+  easylayer:
+    image: easylayer:local
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/healthz || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+
+  traffic-generator:
+    image: traffic-generator:local
+    depends_on:
+      easylayer:
+        condition: service_healthy
+```
+
+조건별 의미:
+
+| 조건 | 의미 | 사용 기준 |
+| --- | --- | --- |
+| `service_started` | 의존 서비스 컨테이너가 시작되면 통과 | 단순 시작 순서만 필요할 때 |
+| `service_healthy` | 의존 서비스 healthcheck가 healthy가 되면 통과 | API, DB, control plane readiness가 필요할 때 |
+| `service_completed_successfully` | 의존 서비스가 0 exit code로 끝나면 통과 | migration, config generation 같은 one-shot job |
+
+예를 들어 설정 검증이나 룰 변환을 먼저 끝낸 뒤 이지레이어를 시작해야 한다면 one-shot job을 둘 수 있다.
+
+```yaml
+services:
+  config-check:
+    image: easylayer:local
+    command: ["easylayer", "validate", "--config", "/etc/easylayer/easylayer.yaml"]
+    volumes:
+      - ./config:/etc/easylayer:ro
+
+  easylayer:
+    image: easylayer:local
+    depends_on:
+      config-check:
+        condition: service_completed_successfully
+```
+
+그래도 애플리케이션 자체의 retry는 필요하다. Compose는 시작 시점의 순서를 도와주는 도구이지, 실행 중 의존 서비스가 재시작되거나 네트워크가 흔들릴 때의 복구 로직까지 대신하지 않는다.
+
+## 11. 운영에 가까운 검증 checklist
 
 Compose로 이지레이어를 띄우기 전 확인할 것:
 
 - 이미지가 깨끗한 환경에서 `docker compose build --no-cache`로 빌드되는가
 - 설정 파일이 이미지에 박혀 있지 않고 mount 또는 환경 변수로 분리되어 있는가
+- 의존 서비스가 있다면 `depends_on` 짧은 문법만으로 readiness를 기대하지 않는가
+- readiness가 필요한 의존성은 healthcheck와 `condition: service_healthy`로 표현했는가
 - bridge/host/macvlan 중 실제 packet path에 맞는 network mode를 선택했는가
 - 필요한 capability만 추가했는가
 - `privileged: true`가 정말 필요한지 설명할 수 있는가
@@ -291,7 +377,7 @@ Compose로 이지레이어를 띄우기 전 확인할 것:
 - 컨테이너 종료 시 signal을 받고 정상 종료하는가
 - CPU, hugepage, device 의존성이 README 또는 compose 주석으로 남아 있는가
 
-## 11. 정리 명령
+## 12. 정리 명령
 
 ```bash
 docker compose down

@@ -168,6 +168,10 @@ Compose는 다음 역할을 담당한다.
 | healthcheck | 프로세스 실행 여부가 아니라 서비스 준비 상태 표현 |
 | depends_on | 시작 순서 의존성 표현 |
 
+`depends_on`의 짧은 문법은 컨테이너 생성과 시작 순서를 제어할 뿐, 의존 서비스가 실제 요청을 처리할 준비가 됐다는 뜻은 아니다. readiness가 중요한 서비스는 의존 대상에 `healthcheck`를 정의하고, 의존하는 서비스에서 `condition: service_healthy`를 명시해야 한다.
+
+그래도 `depends_on`은 애플리케이션 레벨의 retry, timeout, reconnect 로직을 대체하지 않는다. Compose가 시작 순서를 도와줄 수는 있지만, 네트워크 지연, DB migration, control API 초기화, 외부 장치 준비 같은 런타임 문제는 애플리케이션이 견딜 수 있어야 한다.
+
 Compose를 사용하면 프로젝트 전용 bridge network가 생성되고, 서비스 이름이 DNS 이름처럼 동작한다. 이 구조는 로컬 개발, 통합 테스트, 단일 host 실험에 적합하다.
 
 ### 이지레이어 빌드 관점
@@ -202,9 +206,9 @@ Compose는 단일 host 환경을 명확하게 구성하는 데 강하다. 여러
 
 ## 4. Container PID namespace 내부
 
-실습 문서: 예정
+실습 문서: [04-container-pid-namespace.md](./practices/04-container-pid-namespace.md)
 
-컨테이너는 host와 분리된 PID namespace 안에서 실행될 수 있다. 이때 host에서 보이는 프로세스 ID와 컨테이너 내부에서 보이는 프로세스 ID가 다르다.
+컨테이너는 host와 분리된 PID namespace 안에서 실행될 수 있다. PID namespace는 프로세스 ID 공간을 분리한다. 같은 프로세스라도 host PID namespace에서 보이는 PID와 컨테이너 내부에서 보이는 PID가 다를 수 있다.
 
 ```text
 host PID namespace
@@ -214,25 +218,97 @@ container PID namespace
   same process: PID 1
 ```
 
-컨테이너 내부의 첫 번째 프로세스는 PID 1이 된다. PID 1은 일반 프로세스와 다른 책임을 가진다.
+Docker에서 `docker inspect -f '{{.State.Pid}}' <container>`로 확인하는 PID는 host PID namespace 기준의 PID다. 반대로 컨테이너 안에서 `ps`를 실행하면 컨테이너 PID namespace 기준의 PID가 보인다.
+
+PID namespace는 계층 구조다. host는 하위 PID namespace의 프로세스를 볼 수 있지만, 컨테이너 내부에서는 host의 전체 프로세스 목록이 보이지 않는다. 이 구조가 컨테이너 프로세스 격리의 핵심이다.
+
+### 컨테이너 PID 1의 의미
+
+컨테이너 내부의 첫 번째 프로세스는 PID 1이 된다. 이 프로세스는 단순히 번호가 1인 프로세스가 아니라 해당 PID namespace의 init 프로세스 역할을 한다.
 
 | 책임 | 설명 |
 | --- | --- |
-| signal 처리 | 종료 신호를 애플리케이션에 올바르게 전달해야 한다. |
-| child process 회수 | 종료된 child process를 회수하지 않으면 zombie가 남을 수 있다. |
 | 컨테이너 생명주기 | PID 1이 종료되면 컨테이너도 종료된다. |
+| signal 처리 | `SIGTERM`, `SIGINT` 같은 종료 신호를 애플리케이션 로직에 맞게 처리해야 한다. |
+| child process 회수 | 종료된 child process를 `wait` 계열 호출로 회수해야 zombie가 남지 않는다. |
+| orphan process 수용 | 부모가 먼저 종료된 child process가 PID 1로 재부모화될 수 있다. |
 
-컨테이너에서 애플리케이션 바이너리를 바로 PID 1로 실행할 때는 signal handling과 zombie process 처리가 중요하다. 이를 보완하기 위해 작은 init 프로세스를 넣는 방식이 자주 사용된다.
+Docker에서 `docker stop`을 실행하면 기본적으로 PID 1에 `SIGTERM`을 보내고, 제한 시간 안에 종료되지 않으면 `SIGKILL`을 보낸다. 따라서 PID 1이 신호를 제대로 처리하지 않으면 정상 종료 로직, 로그 flush, connection drain, 임시 파일 정리 같은 작업이 실행되지 않을 수 있다.
 
-`host PID namespace`를 공유하면 디버깅에는 편하지만 프로세스 격리가 약해진다. 운영 환경에서는 필요한 이유가 명확할 때만 사용해야 한다.
+특히 shell wrapper가 PID 1이 되는 형태는 주의해야 한다.
+
+```dockerfile
+CMD sh -c "my-server --config /etc/app/config.yaml"
+```
+
+이런 형태에서는 shell이 PID 1이 되고 실제 애플리케이션은 child process가 된다. shell이 종료 신호를 애플리케이션에 전달하지 않거나 child process를 회수하지 않으면 종료 지연 또는 zombie process 문제가 생길 수 있다.
+
+가능하면 다음 방향을 우선한다.
+
+| 방식 | 판단 |
+| --- | --- |
+| exec form 사용 | `CMD ["my-server", "--config", "/etc/app/config.yaml"]`처럼 애플리케이션이 직접 PID 1이 된다. |
+| shell script에서 `exec` 사용 | wrapper가 필요하면 마지막 실행은 `exec my-server ...`로 교체한다. |
+| 작은 init 사용 | child process 회수와 signal forwarding이 필요하면 `docker run --init` 또는 Compose `init: true`를 쓴다. |
+
+### zombie process와 init
+
+zombie process는 종료됐지만 부모가 종료 상태를 회수하지 않아 process table에 남아 있는 상태다. 일반 Linux 시스템에서는 init 계열 프로세스가 orphan process를 회수한다. 컨테이너에서는 이 역할을 컨테이너 PID 1이 맡는다.
+
+`docker run --init`을 사용하면 Docker가 작은 init 프로세스를 PID 1로 넣는다. 이 init은 신호 전달과 orphan child 회수에 도움을 준다. 다만 애플리케이션이 직접 만든 child process를 계속 회수하지 않는 버그까지 자동으로 고쳐주는 것은 아니다. 애플리케이션 자체의 signal handling과 child process 관리도 여전히 중요하다.
+
+Compose에서는 다음처럼 같은 효과를 줄 수 있다.
+
+```yaml
+services:
+  app:
+    image: app:local
+    init: true
+```
+
+### 관찰 도구
+
+PID namespace를 분석할 때 자주 쓰는 도구는 다음과 같다.
+
+| 도구 | 용도 |
+| --- | --- |
+| `docker top <container>` | host 기준에서 컨테이너 프로세스 목록을 본다. |
+| `docker inspect -f '{{.State.Pid}}'` | 컨테이너의 host PID를 확인한다. |
+| `docker exec <container> ps` | 컨테이너 내부 PID namespace 기준으로 프로세스를 본다. |
+| `nsenter -t <pid> -p` | host에서 특정 프로세스의 PID namespace로 진입한다. |
+| `/proc/<pid>/ns/pid` | 프로세스가 속한 PID namespace inode를 확인한다. |
+
+`nsenter`로 PID namespace에 들어가 process tree를 정확히 보려면 mount namespace와 `/proc` mount까지 함께 고려해야 한다. PID namespace만 바꾸고 host의 `/proc`를 그대로 보면 출력이 혼동될 수 있다.
+
+### PID namespace mode 선택
+
+Docker의 기본값은 컨테이너별 private PID namespace다. 필요하면 다른 모드도 선택할 수 있다.
+
+| 방식 | 의미 | 사용 기준 |
+| --- | --- | --- |
+| 기본값 | 컨테이너마다 별도 PID namespace 사용 | 일반 애플리케이션 기본 선택 |
+| `--pid=host` | host PID namespace 공유 | host 프로세스 관찰, low-level debugging, 일부 monitoring agent |
+| `--pid=container:<id>` | 다른 컨테이너의 PID namespace 공유 | sidecar 디버깅, 같은 Pod와 유사한 실험 |
+
+`--pid=host`는 컨테이너에서 host의 프로세스 목록을 볼 수 있게 하므로 격리가 약해진다. 운영 환경에서는 모니터링 에이전트처럼 이유가 명확한 경우에만 사용해야 한다.
+
+### 개념 판단 기준
+
+| 질문 | 판단 |
+| --- | --- |
+| 컨테이너가 종료 신호를 받고 정상 종료해야 하는가 | PID 1의 signal handling을 반드시 확인한다. |
+| wrapper shell이 필요한가 | 마지막 실행은 `exec`로 교체하는지 확인한다. |
+| child process를 생성하는가 | zombie 회수 책임이 어디에 있는지 확인한다. |
+| 여러 프로세스를 한 컨테이너에 넣는가 | `--init` 또는 process supervisor 필요성을 검토한다. |
+| host process 관찰이 필요한가 | `--pid=host`의 격리 약화를 감수할 이유가 있는지 기록한다. |
 
 ---
 
 ## 5. OverlayFS와 이미지 레이어
 
-실습 문서: 예정
+실습 문서: [05-overlayfs-image-layers.md](./practices/05-overlayfs-image-layers.md)
 
-Docker 이미지는 여러 read-only layer의 합성이다. 컨테이너가 실행되면 그 위에 writable layer가 추가된다.
+Docker 이미지는 여러 read-only layer의 합성이다. 컨테이너가 실행되면 그 위에 container writable layer가 추가된다. 이미지 자체는 바뀌지 않고, 컨테이너 실행 중 생긴 변경사항은 writable layer에 기록된다.
 
 ```text
 container writable layer
@@ -241,74 +317,305 @@ image layer N-1
 base image layer
 ```
 
-OverlayFS는 여러 디렉터리를 하나의 파일 시스템처럼 보이게 만든다.
+OverlayFS는 여러 디렉터리를 하나의 파일 시스템처럼 보이게 만드는 union filesystem이다. Docker 환경에서는 전통적으로 `overlay2` storage driver에서 이 구조를 관찰할 수 있고, 최신 Docker/containerd 조합에서는 `overlayfs` snapshotter처럼 구현 이름과 host 경로가 달라질 수 있다. 학습 관점에서는 `lowerdir`, `upperdir`, `workdir`, `merged`의 역할을 이해하는 것이 핵심이다.
 
 | 개념 | 의미 |
 | --- | --- |
-| `lowerdir` | 읽기 전용 이미지 레이어 |
-| `upperdir` | 컨테이너 또는 빌드 단계의 쓰기 가능 레이어 |
-| `workdir` | OverlayFS 내부 작업 디렉터리 |
-| `merged` | 사용자에게 보이는 합성 결과 |
+| `lowerdir` | 읽기 전용 이미지 레이어 묶음 |
+| `upperdir` | 컨테이너 writable layer 또는 빌드 중 쓰기 가능 레이어 |
+| `workdir` | OverlayFS가 내부 작업에 사용하는 디렉터리 |
+| `merged` | 컨테이너 프로세스가 보는 합성 파일 시스템 |
 
-컨테이너 안에서 파일을 수정하면 기존 이미지 레이어를 직접 바꾸지 않는다. 변경된 파일은 writable layer에 기록된다. 이를 copy-on-write라고 한다.
+### 읽기, 쓰기, 삭제 흐름
 
-이미지 레이어 구조는 Dockerfile 작성 방식과 직접 연결된다. 자주 변하는 파일을 뒤쪽 layer에 두면 빌드 캐시 재사용성이 좋아지고, 불필요한 빌드 도구를 runtime 이미지에 남기지 않으면 이미지 크기와 공격면이 줄어든다.
+컨테이너에서 파일을 읽을 때 OverlayFS는 먼저 `upperdir`을 보고, 없으면 `lowerdir`의 이미지 레이어에서 찾는다. 따라서 컨테이너는 하나의 파일 시스템을 보는 것처럼 느끼지만 실제 데이터는 여러 레이어에 나뉘어 있다.
+
+컨테이너가 기존 이미지 레이어의 파일을 처음 수정하면 Docker는 해당 파일을 writable layer로 복사한 뒤 수정한다. 이를 copy-on-write라고 한다. OverlayFS의 copy-up은 파일 단위로 동작하므로, 큰 파일의 일부만 바꿔도 첫 수정 시 전체 파일 복사가 발생할 수 있다.
+
+파일 삭제도 lower layer를 직접 지우는 방식이 아니다. 이미지 layer는 read-only이므로, writable layer에 whiteout 정보를 남겨 컨테이너 관점에서 해당 파일이 사라진 것처럼 보이게 한다.
+
+### Dockerfile과 layer
+
+Dockerfile의 파일 시스템 변경은 이미지 layer와 빌드 캐시에 직접 영향을 준다. 특히 `RUN`, `COPY`, `ADD`처럼 파일 시스템을 바꾸는 명령은 layer를 만들고, 앞쪽 layer가 바뀌면 뒤쪽 layer의 cache도 다시 계산된다.
+
+| 작성 방식 | 영향 |
+| --- | --- |
+| 자주 바뀌지 않는 의존성 설치를 앞에 둔다 | 소스 변경 시 package install cache를 재사용하기 쉽다. |
+| 자주 바뀌는 소스 `COPY`를 뒤에 둔다 | 코드 수정이 불필요하게 앞쪽 layer를 깨지 않는다. |
+| `.dockerignore`를 관리한다 | build context가 작아지고 cache invalidation 범위가 줄어든다. |
+| 빌드 산출물만 runtime image로 복사한다 | 이미지 크기와 공격면이 줄어든다. |
+| 로그와 상태 파일은 volume으로 뺀다 | container writable layer가 커지는 것을 막는다. |
 
 이지레이어처럼 C++ 빌드 산출물이 큰 프로젝트는 multi-stage build를 적극적으로 사용하는 것이 좋다. 빌드 도구, header, static library, test artifact를 runtime image에서 제거하면 배포 이미지가 단순해진다.
+
+### 운영 판단 기준
+
+| 질문 | 판단 |
+| --- | --- |
+| 컨테이너에서 계속 증가하는 파일이 있는가 | 로그, pcap, DB 파일은 volume 또는 bind mount로 분리한다. |
+| 큰 파일을 런타임에 자주 수정하는가 | copy-up 비용을 피하도록 파일 배치를 조정한다. |
+| 빌드가 소스 수정마다 너무 오래 걸리는가 | Dockerfile layer 순서와 build context를 확인한다. |
+| 운영 이미지에 빌드 도구가 남아 있는가 | multi-stage build로 runtime image를 분리한다. |
+| Docker Desktop에서 host 경로를 확인하는가 | OverlayFS 경로는 내부 Linux VM 기준이라는 점을 고려한다. |
+
+OverlayFS는 컨테이너 파일 시스템을 효율적으로 합성하는 장치이지, 지속 데이터 저장소가 아니다. 컨테이너 삭제와 함께 사라지면 안 되는 데이터는 volume, bind mount, 외부 저장소로 분리해야 한다.
 
 ---
 
 ## 6. Kubernetes까지 연결
 
-실습 문서: 예정
+실습 문서: [06-docker-to-kubernetes.md](./practices/06-docker-to-kubernetes.md)
 
-Docker에서 배운 개념은 Kubernetes에서도 대부분 이어진다. 차이는 Kubernetes가 단일 host의 컨테이너 실행 도구가 아니라 여러 노드에 걸쳐 컨테이너를 배치하고 관리하는 오케스트레이션 시스템이라는 점이다.
+Docker에서 배운 개념은 Kubernetes에서도 대부분 이어진다. 차이는 Kubernetes가 단일 host에서 컨테이너를 실행하는 도구가 아니라, 여러 노드에 걸쳐 원하는 상태를 선언하고 control plane이 그 상태에 맞게 조정하는 오케스트레이션 시스템이라는 점이다.
+
+Docker Compose는 “이 host에서 이 컨테이너 묶음을 어떻게 띄울 것인가”에 가깝고, Kubernetes는 “클러스터가 어떤 상태를 유지해야 하는가”에 가깝다. 그래서 Compose 파일을 Kubernetes manifest로 옮기는 일은 단순 필드 변환이 아니라 workload, network, storage, config, security 모델을 다시 배치하는 작업이다.
 
 | Docker/Compose | Kubernetes |
 | --- | --- |
-| Container | Container |
-| Image | Container image |
-| Compose service | Deployment, StatefulSet, DaemonSet |
-| Docker network | CNI network |
-| Published port | Service, Ingress, NodePort, LoadBalancer |
-| Volume | PersistentVolume, PersistentVolumeClaim |
-| Environment | Env, ConfigMap, Secret |
-| Healthcheck | livenessProbe, readinessProbe, startupProbe |
+| Docker image | Container image |
+| Container | Pod 안의 container |
+| Compose service | Deployment, DaemonSet, StatefulSet, Job |
+| Compose project network | Pod network, Service, NetworkPolicy |
+| Published port | Service `ClusterIP`, `NodePort`, `LoadBalancer`, Ingress/Gateway |
+| Bind mount / named volume | Volume, PersistentVolumeClaim, `hostPath`, `emptyDir` |
+| `.env`, `environment` | Env, ConfigMap, Secret |
+| `healthcheck` | `readinessProbe`, `livenessProbe`, `startupProbe` |
+| `restart`, `depends_on` | Controller reconciliation, probe, init container, Job |
+| `cap_add`, `devices`, `privileged` | `securityContext`, device plugin, resource request |
 
-Kubernetes의 최소 배포 단위는 컨테이너가 아니라 Pod다. 같은 Pod 안의 컨테이너들은 network namespace를 공유하므로 `localhost`를 통해 통신할 수 있다.
+### Pod와 workload controller
 
-Docker bridge 네트워크를 이해하면 Kubernetes의 CNI, Pod IP, Service, kube-proxy, iptables/IPVS/eBPF data path를 이해하기 쉬워진다.
+Kubernetes의 최소 배포 단위는 컨테이너가 아니라 Pod다. Pod는 하나 이상의 컨테이너가 storage와 network context를 공유하는 논리 host다. 같은 Pod 안의 컨테이너들은 같은 IP와 port space를 공유하므로 `localhost`로 통신할 수 있다.
 
-이지레이어를 Kubernetes로 옮길 때는 일반 Deployment보다 DaemonSet, `hostNetwork`, `securityContext`, device plugin, hugepage resource, CPU pinning 같은 항목을 검토해야 할 가능성이 높다.
+일반적으로 Pod를 직접 운영 단위로 만들기보다는 controller를 사용한다.
+
+| 리소스 | 적합한 경우 |
+| --- | --- |
+| Deployment | stateless control API, 일반 서버, rolling update가 필요한 서비스 |
+| StatefulSet | stable network identity와 persistent storage가 필요한 stateful 서비스 |
+| DaemonSet | 모든 노드 또는 특정 노드마다 하나씩 떠야 하는 node-local agent |
+| Job | migration, config 검증, batch 작업처럼 완료가 목표인 one-shot 작업 |
+
+Deployment는 Pod와 ReplicaSet의 선언적 update를 관리한다. Compose service 하나를 Kubernetes로 옮길 때 기본 후보는 Deployment지만, host NIC, node-local file, packet path처럼 “어느 노드에서 실행되는가”가 중요하면 DaemonSet을 먼저 검토해야 한다.
+
+### Runtime과 image
+
+Kubernetes는 container image를 실행하지만 Docker Engine에 직접 묶여 있지는 않다. 현대 Kubernetes는 kubelet이 Container Runtime Interface, CRI를 통해 containerd, CRI-O, Docker Engine용 adapter 같은 runtime과 통신한다.
+
+따라서 이식의 핵심은 Docker 명령 자체가 아니라 image와 runtime 요구사항이다.
+
+| 질문 | 판단 |
+| --- | --- |
+| image가 registry에서 pull 가능한가 | Kubernetes 노드는 local Docker build 결과를 자동으로 공유하지 않는다. |
+| runtime image에 필요한 library가 들어 있는가 | Compose에서 host에 기대던 파일이 image에 없는지 확인한다. |
+| config가 image에 박혀 있는가 | ConfigMap, Secret, volume mount로 분리한다. |
+| Docker socket에 의존하는가 | Kubernetes에서는 강한 권한 경로이므로 대안을 우선 검토한다. |
+
+### Network 모델
+
+Docker 기본 bridge는 한 host 안의 bridge와 NAT 중심으로 이해한다. Kubernetes는 CNI plugin이 구현하는 cluster-wide Pod network를 전제로 한다. 일반적인 Kubernetes network model에서는 Pod마다 cluster 내부에서 고유한 IP가 있고, Pod 간 통신은 같은 노드든 다른 노드든 직접 가능해야 한다.
+
+Kubernetes Service는 변하는 Pod IP 앞에 안정적인 endpoint를 제공한다. Service selector는 label이 맞는 Pod들을 찾고, EndpointSlice는 현재 backend endpoint 집합을 표현한다. kube-proxy 또는 CNI data path는 이 Service 트래픽을 실제 Pod endpoint로 전달한다.
+
+| 계층 | Docker 관점 | Kubernetes 관점 |
+| --- | --- | --- |
+| 컨테이너 간 이름 해석 | 사용자 정의 bridge의 Docker DNS | Service DNS, Pod DNS |
+| 컨테이너 IP | host-local bridge 대역 | cluster-wide Pod CIDR |
+| 외부 공개 | `ports`와 DNAT | Service type, Ingress, Gateway |
+| data path | bridge, veth, iptables/nftables | CNI, veth, routing/overlay, kube-proxy, iptables/IPVS/eBPF 구현 |
+| host network | `--network host` | Pod `hostNetwork: true` |
+
+Service type 선택은 공개 범위에 따라 달라진다.
+
+| Service type | 의미 | 사용 기준 |
+| --- | --- | --- |
+| `ClusterIP` | cluster 내부에서만 접근하는 stable IP | 내부 control API, backend 통신 |
+| `NodePort` | 각 Node IP의 고정 port로 노출 | lab, bare-metal, 외부 LB 앞단 구성 |
+| `LoadBalancer` | cloud/external load balancer와 연동 | cloud 환경의 외부 공개 |
+| Headless Service | cluster IP 없이 endpoint DNS 제공 | StatefulSet, 직접 endpoint discovery |
+
+### Config, Secret, Volume
+
+Compose에서 bind mount와 env로 처리하던 설정은 Kubernetes에서 ConfigMap, Secret, Volume으로 분리한다.
+
+| 항목 | 역할 |
+| --- | --- |
+| ConfigMap | 비밀이 아닌 설정을 env, command argument, file로 주입 |
+| Secret | password, token, key 같은 민감 정보를 별도 API object로 관리 |
+| `emptyDir` | Pod 생명주기에 묶인 임시 공유 디렉터리 |
+| PersistentVolumeClaim | Pod 재생성 후에도 보존해야 하는 storage 요청 |
+| `hostPath` | node filesystem 직접 mount, 보안 위험이 크므로 제한적으로 사용 |
+
+Secret은 ConfigMap보다 민감 정보에 맞는 API object지만, 기본적으로 etcd 저장 암호화와 RBAC 설계를 별도로 챙겨야 한다. `hostPath`는 kubelet credential, runtime socket, host file을 노출할 수 있으므로 node-local agent처럼 이유가 명확한 경우에만 사용한다.
+
+### Probe와 lifecycle
+
+Compose `healthcheck`는 Kubernetes에서 probe로 나뉜다.
+
+| probe | 의미 |
+| --- | --- |
+| `startupProbe` | 느린 초기화가 끝났는지 확인하고, 성공 전까지 다른 probe 간섭을 줄인다. |
+| `readinessProbe` | Service endpoint로 traffic을 받아도 되는지 판단한다. |
+| `livenessProbe` | 프로세스가 복구 불가능한 상태인지 판단하고 재시작을 유도한다. |
+
+readiness와 liveness를 같은 조건으로 두면 장애 처리 의도가 흐려진다. 예를 들어 외부 DB가 잠깐 느린 상황에서 liveness가 실패해 Pod를 계속 재시작하면 오히려 장애를 키울 수 있다. readiness는 traffic 수신 여부, liveness는 자기 프로세스의 복구 불가능 상태에 맞춰 분리하는 편이 안전하다.
+
+### 이지레이어 전환 기준
+
+이지레이어를 Kubernetes로 옮길 때는 control plane과 packet path를 분리해서 생각한다.
+
+| 요구사항 | Kubernetes 후보 |
+| --- | --- |
+| 일반 control API | Deployment + ClusterIP Service |
+| 노드마다 packet capture 또는 NIC 접근 | DaemonSet |
+| host network stack 직접 사용 | `hostNetwork: true`, `dnsPolicy: ClusterFirstWithHostNet` 검토 |
+| raw socket 또는 interface 설정 | `securityContext.capabilities.add`에서 `NET_RAW`, `NET_ADMIN` 등 최소 부여 |
+| NIC, FPGA, GPU, SR-IOV 같은 장치 | device plugin 또는 vendor plugin |
+| hugepage, CPU 고정, NUMA 배치 | resource request/limit, hugepage resource, CPU Manager, Topology Manager |
+| node-local config/log 접근 | read-only `hostPath` 또는 별도 collector 구조 |
+
+Kubernetes에서 `privileged: true`와 wide-open `hostPath`는 Compose에서보다 더 위험하다. 같은 manifest가 여러 노드에 반복 배포될 수 있고, ServiceAccount/RBAC와 결합되면 cluster 권한 문제로 커질 수 있기 때문이다. 필요한 capability, device, mount, resource를 기능 단위로 좁혀 기록해야 한다.
+
+### 개념 판단 기준
+
+| 질문 | 판단 |
+| --- | --- |
+| 여러 replica가 같은 방식으로 떠도 되는가 | Deployment가 기본 후보 |
+| 특정 node마다 하나씩 떠야 하는가 | DaemonSet을 검토 |
+| Pod IP가 바뀌어도 client가 안정적으로 접근해야 하는가 | Service가 필요 |
+| config 변경이 image rebuild 없이 가능해야 하는가 | ConfigMap/Secret/Volume mount로 분리 |
+| packet path가 host NIC에 직접 묶이는가 | hostNetwork, device plugin, DaemonSet, securityContext를 함께 설계 |
+| 성능 튜닝이 CPU/NUMA/device와 연결되는가 | Kubernetes resource manager와 node 설정까지 같이 본다 |
+
+### 참고 reference
+
+- [Kubernetes Pods](https://kubernetes.io/docs/concepts/workloads/pods/)
+- [Kubernetes Deployments](https://kubernetes.io/docs/concepts/workloads/controllers/deployment/)
+- [Kubernetes Services](https://kubernetes.io/docs/concepts/services-networking/service/)
+- [Kubernetes Services, Load Balancing, and Networking](https://kubernetes.io/docs/concepts/services-networking/)
+- [Kubernetes Network Plugins](https://kubernetes.io/docs/concepts/extend-kubernetes/compute-storage-net/network-plugins/)
+- [Kubernetes ConfigMaps](https://kubernetes.io/docs/concepts/configuration/configmap/)
+- [Kubernetes Secrets](https://kubernetes.io/docs/concepts/configuration/secret/)
+- [Kubernetes Volumes](https://kubernetes.io/docs/concepts/storage/volumes/)
+- [Kubernetes Liveness, Readiness, and Startup Probes](https://kubernetes.io/docs/concepts/configuration/liveness-readiness-startup-probes/)
+- [Kubernetes DaemonSet](https://kubernetes.io/docs/concepts/workloads/controllers/daemonset/)
+- [Kubernetes Device Plugins](https://kubernetes.io/docs/concepts/extend-kubernetes/compute-storage-net/device-plugins/)
+- [Kubernetes Resource Managers](https://kubernetes.io/docs/concepts/workloads/resource-managers/)
+- [Kubernetes Security Context](https://kubernetes.io/docs/tasks/configure-pod-container/security-context/)
+- [Kubernetes Container Runtimes](https://kubernetes.io/docs/setup/production-environment/container-runtimes/)
 
 ---
 
 ## 7. Packet processing 시스템에서 Docker 쓰는 방식
 
-실습 문서: 예정
+실습 문서: [07-packet-processing-docker.md](./practices/07-packet-processing-docker.md)
 
 패킷 처리 시스템에서 Docker를 사용할 때는 일반 웹 서비스보다 네트워크 성능, NIC 접근, 커널 기능, 권한 모델이 더 중요하다.
 
-대표적인 실행 방식은 다음과 같다.
+핵심은 control plane과 packet data path를 분리해서 설계하는 것이다. 관리 API, metrics, health endpoint는 Docker bridge network나 Kubernetes Service로 충분한 경우가 많다. 반대로 실제 packet RX/TX 경로는 host NIC, driver, queue, IRQ, NUMA, hugepage, capability와 직접 연결될 수 있다.
+
+### 네트워크 모드 선택
 
 | 방식 | 성격 | 주요 trade-off |
 | --- | --- | --- |
-| bridge network | Docker 기본 네트워크 | 관리가 쉽지만 NAT/bridge 경로가 추가된다. |
-| host network | host stack 공유 | 경로가 단순하지만 격리가 약해지고 포트 충돌이 생길 수 있다. |
-| macvlan/ipvlan | 컨테이너를 별도 네트워크 엔드포인트처럼 노출 | L2/L3 설계가 명확해야 하며 host와 통신 제약이 있을 수 있다. |
-| raw socket/libpcap | 커널 네트워크 스택을 사용한 packet I/O | 권한과 성능 한계를 함께 고려해야 한다. |
-| AF_XDP | kernel bypass에 가까운 고성능 packet path | kernel, driver, NIC 지원이 필요하다. |
-| DPDK | user-space packet processing | hugepage, NIC binding, CPU/NUMA 튜닝이 필요하다. |
+| bridge network | Docker 기본 네트워크 | 관리가 쉽고 DNS/포트 매핑이 편하지만 bridge, veth, NAT 경로가 추가된다. |
+| host network | host network namespace 공유 | 경로가 단순하고 port mapping이 없어지지만 격리가 약해지고 port 충돌이 생긴다. |
+| macvlan | 컨테이너가 물리망의 별도 MAC을 가진 장비처럼 보임 | L2 설계가 명확해야 하고, host와 macvlan 컨테이너 직접 통신 제약이 있다. |
+| ipvlan | parent NIC의 MAC을 공유하고 IP 단위로 분기 | switch MAC table 부담은 줄지만 L2/L3 mode와 routing 설계를 이해해야 한다. |
+| `none` + 직접 구성 | Docker 기본 네트워크를 쓰지 않음 | 실험 자유도는 높지만 route, veth, namespace 구성을 직접 책임진다. |
 
-이지레이어가 어떤 packet I/O 모델을 쓰는지에 따라 Docker 설계가 달라진다. control API는 bridge network에 두고, packet path만 host network나 device 기반 접근으로 분리하는 구조가 현실적인 출발점이다.
+Docker bridge는 control API, 관리 plane, 일반 TCP/UDP 서비스에 좋은 기본값이다. packet path 자체를 실험할 때는 bridge의 NAT와 veth 경로가 측정 결과에 섞일 수 있으므로 host, macvlan, ipvlan, 또는 device 기반 접근을 별도로 검토한다.
 
-권한은 기능 요구사항에서 역으로 도출해야 한다. 예를 들어 raw socket이 필요하면 `NET_RAW`, 인터페이스 설정이 필요하면 `NET_ADMIN`, hugepage와 memory lock이 필요하면 `IPC_LOCK`을 검토한다. `privileged`는 빠른 디버깅에는 편하지만 운영 설계의 기본값으로 두면 안 된다.
+Docker는 bridge network에는 firewall/NAT 규칙을 만들지만, host, macvlan, ipvlan network에는 같은 방식의 Docker firewall rule을 만들지 않는다. 이 차이는 보안 정책과 packet trace 위치를 정할 때 중요하다.
+
+### Packet I/O 방식
+
+패킷 처리 애플리케이션이 실제로 어느 API를 쓰는지가 Docker 설계를 결정한다.
+
+| 방식 | kernel stack 사용 | 컨테이너 설계 포인트 |
+| --- | --- | --- |
+| 일반 TCP/UDP socket | 사용 | bridge 또는 host network 선택, port 공개, conntrack 영향 검토 |
+| raw socket / AF_PACKET / libpcap | 사용 | `NET_RAW`, interface visibility, capture 권한, promiscuous mode 검토 |
+| TUN/TAP | 사용 | `/dev/net/tun`, `NET_ADMIN`, route 설정 권한 검토 |
+| AF_XDP | 일부 우회 | XDP program load 권한, NIC driver/queue 지원, UMEM/ring, zero-copy 지원 확인 |
+| DPDK | kernel network stack 우회 가능 | hugepage, VFIO/UIO, PCI device binding, CPU/NUMA 배치, device mount 검토 |
+
+일반 socket과 raw socket은 Linux kernel network stack 위에서 동작한다. 컨테이너가 bridge network에 있으면 container namespace의 인터페이스만 보이고, host network를 쓰면 host의 인터페이스를 그대로 본다.
+
+AF_XDP는 XDP와 user-space socket을 연결해 고성능 packet path를 만들 수 있다. 그러나 NIC driver, queue, XDP mode, kernel version, BPF 권한에 영향을 받으므로 “컨테이너에서 실행된다”는 사실보다 “host에서 XDP가 제대로 동작하는가”가 먼저다.
+
+DPDK는 EAL, hugepage, PCI device, driver binding, CPU core 배치가 핵심이다. 컨테이너는 실행 포장에 가깝고, 실제 성능 조건은 host BIOS, kernel boot option, NIC driver, IOMMU/VFIO, NUMA topology에 의해 결정된다.
+
+### 권한과 장치
+
+권한은 기능 요구사항에서 역으로 도출해야 한다.
+
+| 필요 작업 | 검토 항목 |
+| --- | --- |
+| raw socket 또는 packet socket 열기 | `NET_RAW` |
+| interface, route, qdisc, XDP attach 조작 | `NET_ADMIN` |
+| hugepage, locked memory | `IPC_LOCK`, `ulimits.memlock`, `/dev/hugepages` mount |
+| TUN/TAP 사용 | `/dev/net/tun` device mount, `NET_ADMIN` |
+| VFIO 기반 PCI device 접근 | `/dev/vfio/*`, IOMMU group, device cgroup rule |
+| eBPF/XDP program load | kernel version에 따라 `CAP_BPF`, `CAP_NET_ADMIN`, `CAP_PERFMON` 등 검토 |
+
+`privileged: true`는 디버깅을 빠르게 만들지만, host device와 capability를 과하게 열기 때문에 운영 설계의 기본값으로 두면 안 된다. 최소 capability, 필요한 device, read-only mount, 명확한 resource limit을 조합하는 편이 낫다.
+
+### 성능 튜닝 축
+
+packet processing에서는 컨테이너 옵션만으로 성능을 보장할 수 없다. host와 애플리케이션의 배치를 함께 봐야 한다.
+
+| 축 | 확인할 내용 |
+| --- | --- |
+| CPU pinning | Docker `cpuset`, DPDK `--lcores`, thread affinity가 서로 충돌하지 않는지 확인 |
+| NUMA locality | NIC가 붙은 NUMA node와 worker core, memory allocation 위치를 맞춤 |
+| IRQ affinity | NIC queue interrupt가 worker core 또는 housekeeping core로 의도대로 배치되는지 확인 |
+| RSS / queue | NIC queue 수, RSS hash, worker thread 수가 맞는지 확인 |
+| hugepage | DPDK/고성능 allocator가 요구하는 hugepage 크기와 NUMA별 할당량 확인 |
+| logging | hot path에서 동기 로그, pcap dump, stdout 과다 출력이 없는지 확인 |
+
+Docker `cpuset`은 컨테이너 프로세스가 실행 가능한 CPU를 제한한다. DPDK `--lcores`는 애플리케이션 내부 lcore를 물리 CPU에 매핑한다. 둘이 어긋나면 DPDK는 특정 core를 쓰도록 설정됐지만 컨테이너 cgroup이 그 CPU를 허용하지 않는 상황이 생길 수 있다.
+
+IRQ affinity는 컨테이너 내부가 아니라 host의 `/proc/irq/*/smp_affinity_list`와 NIC driver 설정에서 조정한다. packet path가 host NIC interrupt에 민감하면 Compose 파일만 봐서는 충분하지 않다.
+
+### 이지레이어 판단 기준
+
+이지레이어가 어떤 packet I/O 모델을 쓰는지 먼저 확인해야 한다.
+
+| 질문 | 설계 영향 |
+| --- | --- |
+| 일반 TCP/UDP 서버인가 | bridge network + port mapping 또는 Kubernetes Service가 기본 출발점 |
+| raw packet capture가 필요한가 | host network, `NET_RAW`, interface 선택, pcap output 위치 검토 |
+| interface 설정이나 route 조작이 필요한가 | `NET_ADMIN` 필요성과 명령 범위 확인 |
+| AF_XDP를 쓰는가 | host kernel/NIC/driver/XDP queue 지원, BPF 권한, hostNetwork 여부 확인 |
+| DPDK를 쓰는가 | hugepage, VFIO/UIO, PCI binding, `/dev/vfio`, CPU/NUMA 배치 확인 |
+| 노드마다 NIC를 붙잡아야 하는가 | Kubernetes에서는 DaemonSet과 device plugin 또는 node selector 검토 |
+| control API와 packet path를 분리할 수 있는가 | control API는 bridge/Service, packet path는 host/device 기반으로 나누는 구조 검토 |
+
+현실적인 출발점은 control API와 metrics를 일반 network에 두고, packet path만 host network 또는 device 기반 접근으로 분리하는 것이다. 이 구조는 운영 관측성과 성능 실험을 동시에 다루기 쉽다.
+
+### 참고 reference
+
+- [Docker network drivers](https://docs.docker.com/engine/network/drivers/)
+- [Docker bridge network driver](https://docs.docker.com/engine/network/drivers/bridge/)
+- [Docker host network driver](https://docs.docker.com/engine/network/drivers/host/)
+- [Docker macvlan network driver](https://docs.docker.com/engine/network/drivers/macvlan/)
+- [Docker ipvlan network driver](https://docs.docker.com/engine/network/drivers/ipvlan/)
+- [Docker packet filtering and firewalls](https://docs.docker.com/engine/network/packet-filtering-firewalls/)
+- [Docker run reference: runtime privilege and Linux capabilities](https://docs.docker.com/engine/containers/run/)
+- [Docker Compose services reference](https://docs.docker.com/reference/compose-file/services/)
+- [Linux kernel AF_XDP documentation](https://docs.kernel.org/networking/af_xdp.html)
+- [Linux kernel SMP IRQ affinity](https://www.kernel.org/doc/html/v6.9/core-api/irq/irq-affinity.html)
+- [Linux kernel CPU isolation](https://docs.kernel.org/admin-guide/cpu-isolation.html)
+- [DPDK Getting Started Guide for Linux](https://doc.dpdk.org/guides/linux_gsg/)
+- [DPDK Running Sample Applications](https://doc.dpdk.org/guides/linux_gsg/build_sample_apps.html)
+- [DPDK EAL parameters](https://doc.dpdk.org/guides-25.11/linux_gsg/linux_eal_parameters.html)
 
 ---
 
 ## 8. Docker 보안: capability, seccomp, rootless
 
-실습 문서: 예정
+실습 문서: [08-docker-security.md](./practices/08-docker-security.md)
 
 Docker 보안은 하나의 기능이 아니라 여러 격리 장치의 조합이다.
 
@@ -322,7 +629,67 @@ Docker 보안은 하나의 기능이 아니라 여러 격리 장치의 조합이
 | user namespace | 컨테이너 root와 host root의 매핑을 분리한다. |
 | rootless mode | daemon과 컨테이너를 root 권한 없이 실행한다. |
 
-컨테이너 안의 root는 host root와 완전히 같은 의미는 아니지만, 위험한 mount와 capability가 결합되면 host 침해로 이어질 수 있다. 특히 Docker socket mount, `privileged`, host root filesystem mount는 강한 권한 상승 경로가 될 수 있다.
+컨테이너 안의 root는 host root와 완전히 같은 의미는 아니지만, 위험한 mount와 capability가 결합되면 host 침해로 이어질 수 있다. 특히 Docker socket mount, `privileged`, host root filesystem mount, 넓은 device mount는 강한 권한 상승 경로가 될 수 있다.
+
+### 기본 보안 모델
+
+Docker는 기본적으로 container process를 host process와 분리한다. 그러나 Docker daemon은 일반적으로 root 권한으로 실행되고, container runtime은 host namespace, cgroup, mount, network, device 설정을 조작한다. 그래서 “컨테이너 내부에서 root가 아니다”와 “Docker daemon을 제어할 수 없다”는 별개 문제다.
+
+Docker socket에 접근할 수 있는 사용자는 Docker daemon에 API 요청을 보낼 수 있다. 이 권한은 host filesystem mount, privileged container 실행 같은 방식으로 host root에 준하는 영향력을 가질 수 있다. `docker` group도 단순 편의 권한이 아니라 root-level 권한으로 취급해야 한다.
+
+### Capability 최소화
+
+Linux capability는 root 권한을 세부 권한으로 나눈 것이다. Docker는 기본 capability 집합을 제공하고, 필요하면 `cap_drop`, `cap_add`로 조정한다.
+
+| 작업 | 필요한 권한 후보 | 주의점 |
+| --- | --- | --- |
+| raw socket, packet socket | `NET_RAW` | packet capture 또는 ping 같은 기능과 연결 |
+| interface, route, qdisc, XDP attach | `NET_ADMIN` | 네트워크 설정 변경 범위가 넓음 |
+| hugepage, memory lock | `IPC_LOCK`, `ulimits.memlock` | DPDK/고성능 packet path에서 자주 등장 |
+| ptrace/debugging | `SYS_PTRACE` | 운영 기본값으로 열지 않음 |
+| mount, namespace, 많은 관리 작업 | `SYS_ADMIN` | 너무 넓어 사실상 작은 `privileged`처럼 취급 |
+
+운영 기본값은 `cap_drop: [ALL]`에서 시작하고 필요한 capability만 다시 더하는 방식이 가장 명확하다. 다만 일부 이미지나 runtime은 기본 capability를 전제로 만들어졌을 수 있으므로 기능 테스트가 필요하다.
+
+### Seccomp
+
+seccomp는 컨테이너 프로세스가 호출할 수 있는 syscall을 제한한다. Docker의 기본 seccomp profile은 allowlist 방식으로 동작하며, 위험하거나 namespacing이 어려운 syscall을 막는다.
+
+기본 profile을 끄는 `seccomp=unconfined`는 문제 원인 확인용으로만 사용하고, 운영 기본값으로 두지 않는다. 특정 syscall이 꼭 필요하다면 해당 기능을 재현하는 최소 테스트를 만들고 custom seccomp profile에 필요한 예외만 추가한다.
+
+### AppArmor와 SELinux
+
+AppArmor와 SELinux는 Linux Security Module, LSM 계층에서 파일, process, capability, mount, network 접근을 더 제한한다. 배포판에 따라 기본 보안 모듈이 다르다.
+
+| 항목 | 특징 |
+| --- | --- |
+| AppArmor | profile 이름 기반 정책. Docker는 기본적으로 `docker-default` profile을 사용할 수 있다. |
+| SELinux | label 기반 정책. volume mount에는 `:z`, `:Z` label 옵션이 영향을 준다. |
+
+LSM은 capability보다 더 세밀하게 파일과 kernel object 접근을 막을 수 있다. 반대로 잘못된 profile이나 label은 정상 volume mount와 device 접근을 막을 수 있으므로, permission denied가 발생하면 capability뿐 아니라 AppArmor/SELinux audit log도 함께 확인한다.
+
+### User namespace와 rootless
+
+user namespace remap은 컨테이너 내부 UID 0을 host의 비특권 UID 범위에 매핑한다. 컨테이너 안에서는 root처럼 보이지만 host에서는 높은 번호의 비특권 UID로 동작한다. 단, `userns-remap`에서는 Docker daemon 자체는 여전히 root로 실행된다.
+
+rootless mode는 Docker daemon과 container를 모두 비root 사용자 namespace 안에서 실행한다. daemon/runtime 취약점의 영향을 줄이는 데 도움이 되지만, network, cgroup, privileged workload, 일부 storage/device 기능에 제약이 있을 수 있다.
+
+| 방식 | 장점 | 제약 |
+| --- | --- | --- |
+| non-root user in container | 애플리케이션 권한 축소가 단순함 | Docker daemon/root mount 위험은 별도 문제 |
+| userns-remap | container root를 host 비특권 UID로 매핑 | daemon은 root, 기존 `/var/lib/docker`와 호환 주의 |
+| rootless Docker | daemon과 container 모두 비root 실행 | network/device/cgroup 기능 제약 가능 |
+
+### 위험한 패턴
+
+| 패턴 | 위험 |
+| --- | --- |
+| `/var/run/docker.sock` mount | 컨테이너가 Docker daemon API를 통해 host 제어 가능 |
+| `privileged: true` | 모든 capability, 많은 device, LSM 완화가 결합됨 |
+| host root filesystem mount | host 파일 변경과 secret 탈취 가능 |
+| broad `hostPath` 또는 bind mount | container escape가 아니어도 host 데이터 손상 가능 |
+| `seccomp=unconfined`, `apparmor=unconfined`, `label=disable` | 방어선을 의도적으로 제거 |
+| root user + writable rootfs | 침해 후 persistence와 도구 설치가 쉬워짐 |
 
 보안 설계의 기본 방향은 다음과 같다.
 
@@ -334,7 +701,57 @@ Docker 보안은 하나의 기능이 아니라 여러 격리 장치의 조합이
 | syscall 제한 | 기본 seccomp profile을 유지하고 예외만 검토한다. |
 | rootless 검토 | 기능 제약을 감수할 수 있으면 rootless가 방어선을 추가한다. |
 
+추가로 운영 이미지에서는 `read_only: true`, `tmpfs`, read-only config mount, non-root `USER`, `no-new-privileges:true`, 로그/pcap output volume 분리를 함께 검토한다.
+
+### 이지레이어 보안 기준
+
 이지레이어처럼 네트워크 권한이 필요한 서비스는 보안과 기능 요구가 충돌할 수 있다. 이 경우 “왜 이 capability가 필요한지”를 기능 단위로 기록해야 운영 검토가 가능하다.
+
+| 기능 요구 | 보안 설계 |
+| --- | --- |
+| control API만 제공 | non-root user, bridge network, read-only rootfs, default seccomp |
+| raw packet capture | `NET_RAW`만 추가 가능한지 먼저 확인 |
+| interface 설정 필요 | `NET_ADMIN` 범위를 명령/기능 단위로 기록 |
+| AF_XDP/eBPF | kernel capability, BPF mount, hostNetwork 필요성을 분리 검토 |
+| DPDK/VFIO | `/dev/vfio/*`, hugepage mount, `IPC_LOCK`, CPU/NUMA 조건을 최소화 |
+| debug shell 필요 | 운영 이미지가 아니라 debug profile 또는 별도 debug image로 분리 |
+
+운영 Compose 예시는 다음 방향을 기본값으로 둔다.
+
+```yaml
+services:
+  easylayer:
+    image: easylayer:local
+    user: "65532:65532"
+    read_only: true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_RAW
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - ./config:/etc/easylayer:ro
+    tmpfs:
+      - /tmp
+```
+
+이 예시는 출발점일 뿐이다. 실제 packet I/O 방식에 따라 `NET_ADMIN`, `/dev/net/tun`, `/dev/vfio`, hugepage mount, hostNetwork가 추가될 수 있다. 추가할 때마다 기능 요구와 위험을 함께 기록한다.
+
+### 참고 reference
+
+- [Docker Engine security](https://docs.docker.com/engine/security/)
+- [Docker run reference: runtime privilege and Linux capabilities](https://docs.docker.com/engine/containers/run/)
+- [Docker seccomp security profiles](https://docs.docker.com/engine/security/seccomp/)
+- [Docker AppArmor security profiles](https://docs.docker.com/engine/security/apparmor/)
+- [Docker user namespace remap](https://docs.docker.com/engine/security/userns-remap/)
+- [Docker rootless mode](https://docs.docker.com/engine/security/rootless/)
+- [Docker rootless tips](https://docs.docker.com/engine/security/rootless/tips/)
+- [Protect the Docker daemon socket](https://docs.docker.com/engine/security/protect-access/)
+- [Docker bind mounts and SELinux labels](https://docs.docker.com/engine/storage/bind-mounts/)
+- [Docker Compose services reference](https://docs.docker.com/reference/compose-file/services/)
+- [Kubernetes security context](https://kubernetes.io/docs/tasks/configure-pod-container/security-context/)
+- [Kubernetes seccomp](https://kubernetes.io/docs/reference/node/seccomp/)
 
 ---
 
