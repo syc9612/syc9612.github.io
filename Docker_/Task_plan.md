@@ -48,6 +48,7 @@ Docker의 내부 구조를 네트워크, 파일 시스템, 프로세스 격리, 
 - `practices/06-docker-to-kubernetes.md`
 - `practices/07-packet-processing-docker.md`
 - `practices/08-docker-security.md`
+- `practices/09-mini-docker.md`
 
 ## 완료된 섹션
 
@@ -58,6 +59,7 @@ Docker의 내부 구조를 네트워크, 파일 시스템, 프로세스 격리, 
 - Docker 기본 네트워크 구성 요소 정리
 - network namespace, veth pair, Linux bridge, iptables/nftables 역할 정리
 - 컨테이너에서 외부로 나가는 패킷 흐름 설명
+- `eth0`가 veth pair의 컨테이너 쪽 endpoint이고 host 쪽 veth peer가 `docker0`에 붙는다는 표현 보정
 - 외부에서 컨테이너로 들어오는 포트 매핑 흐름 설명
 - 컨테이너 간 통신 구조 설명
 - `--network host` 모드와 bridge 모드 차이 설명
@@ -73,6 +75,7 @@ Docker의 내부 구조를 네트워크, 파일 시스템, 프로세스 격리, 
 - `docker network inspect bridge` 확인
 - 컨테이너 내부 `ip addr`, `ip route`, `/etc/resolv.conf` 확인
 - host의 `docker0`, veth, bridge link 확인
+- `container eth0 <-> peer veth <-> docker0 bridge <-> host routing/NAT <-> host NIC` 구조 그림 추가
 - `MASQUERADE`, `DNAT` 규칙 확인
 - 사용자 정의 bridge network와 Docker DNS 확인
 - host network 모드 비교
@@ -288,22 +291,39 @@ Docker의 내부 구조를 네트워크, 파일 시스템, 프로세스 격리, 
 - 이지레이어 hardened Compose 템플릿과 Kubernetes `securityContext` 예시 추가
 - Troubleshooting, 정리 명령, 공식 reference 추가
 
-## 남은 작업
-
 ### 9장. 직접 미니 Docker 만들기
 
-예정 내용:
+개념 문서:
 
-- `unshare`
-- `chroot` 또는 `pivot_root`
-- `/proc` mount
-- cgroup 제한
-- veth와 bridge 직접 구성
-- 최소 컨테이너 런타임 흐름 이해
+- 학습용 미니 Docker와 실제 Docker의 범위 차이 정리
+- UTS, PID, mount, network, IPC, user, cgroup namespace 역할 정리
+- `unshare`, `chroot`, `pivot_root`, `/proc` mount 관계 정리
+- cgroup v2의 `cgroup.controllers`, `cgroup.subtree_control`, `cgroup.procs`, `memory.max`, `cpu.max`, `pids.max` 역할 설명
+- veth pair, Linux bridge, IP/route, NAT 구성 요소 정리
+- 학습용 미니 Docker 흐름과 실제 Docker가 추가로 제공하는 기능 정리
+- 공식 Linux man-pages와 kernel cgroup v2 reference 섹션 추가
 
-예상 실습 파일:
+실습 문서:
 
 - `practices/09-mini-docker.md`
+
+실습 내용:
+
+- 실습 디렉터리와 Alpine rootfs 준비
+- `chroot`로 rootfs 확인
+- UTS namespace hostname 격리 확인
+- user namespace UID/GID mapping 확인
+- PID namespace와 `/proc` mount 확인
+- `chroot`와 PID/mount namespace 조합 실행
+- mount namespace와 tmpfs mount 격리 확인
+- cgroup v2 선택 실습과 `pids.max`, `memory.max` 예시 추가
+- network namespace, veth pair, Linux bridge 직접 구성
+- rootfs를 network namespace 안에서 실행
+- `pivot_root` 개념과 `chroot` 차이 정리
+- Docker가 추가로 자동화하는 기능 정리
+- Troubleshooting, 정리 명령, 공식 reference 추가
+
+## 남은 작업
 
 ### 10장. Docker Desktop vs Linux Docker 차이
 
@@ -357,6 +377,7 @@ Docker의 내부 구조를 네트워크, 파일 시스템, 프로세스 격리, 
 - 6장 Kubernetes 실습은 실제 cluster에서 `kubectl apply`, EndpointSlice, probe 출력 예시를 검증한 뒤 보강한다.
 - 7장 packet processing 실습은 실제 Linux NIC 환경에서 bridge/host/macvlan/ipvlan, raw socket, DPDK/AF_XDP 가능 여부를 검증한 뒤 보강한다.
 - 8장 보안 실습은 실제 Linux Docker 환경에서 seccomp/AppArmor/SELinux/rootless 출력 예시를 검증한 뒤 보강한다.
+- 9장 미니 Docker 실습은 disposable Linux VM에서 namespace, cgroup, veth/bridge 절차를 검증한 뒤 출력 예시를 보강한다.
 
 ## 다음 작업 우선순위
 
@@ -365,4 +386,5 @@ Docker의 내부 구조를 네트워크, 파일 시스템, 프로세스 격리, 
 3. 6장 Kubernetes 실습을 실제 cluster에서 검증하고 출력 예시 보강
 4. 7장 packet processing 실습을 실제 Linux NIC 환경에서 검증하고 출력 예시 보강
 5. 8장 보안 실습을 실제 Linux Docker 환경에서 검증하고 출력 예시 보강
-6. 9장 `직접 미니 Docker 만들기: unshare, chroot, cgroup` 작성
+6. 9장 미니 Docker 실습을 disposable Linux VM에서 검증하고 출력 예시 보강
+7. 10장 `Docker Desktop vs Linux Docker 차이` 작성

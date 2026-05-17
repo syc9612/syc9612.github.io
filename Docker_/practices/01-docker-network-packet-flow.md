@@ -100,15 +100,38 @@ ip link show type veth
 bridge link
 ```
 
-`docker0`는 host namespace에 있는 Linux bridge다. 컨테이너의 `eth0`와 연결된 반대쪽 veth가 이 bridge에 붙는다.
+`docker0`는 host namespace에 있는 Linux bridge다. 정확히 말하면 컨테이너의 `eth0`는 veth pair의 컨테이너 쪽 endpoint이고, 반대쪽 host veth peer가 `docker0` bridge에 붙는다.
 
 대략적인 구조:
 
 ```text
+[container namespace]                 [host namespace]
+
+container process
+        |
+        v
+eth0, veth endpoint  <--- veth pair --->  peer veth, vethXXXX
+                                                |
+                                                v
+                                      docker0 bridge
+                                      L2 switch 역할
+                                                |
+                                                v
+                                      host routing
+                                      netfilter NAT
+                                                |
+                                                v
+                                      host NIC, eth0/ens...
+```
+
+한 줄로 줄이면 다음 흐름이다.
+
+```text
 container eth0
-  <-> host vethXXXX
-  <-> docker0 bridge
-  <-> host routing
+  <-> peer veth, host veth
+  <-> docker0 bridge, L2 switch
+  -> host routing + netfilter NAT
+  <-> host NIC
 ```
 
 ## 5. 외부로 나가는 패킷의 NAT 확인
@@ -210,7 +233,7 @@ docker run --rm --network host nginx
 
 | 모드 | 경로 | 특징 |
 | --- | --- | --- |
-| bridge | container eth0 -> veth -> docker0 -> NAT -> host NIC | 기본 격리 제공 |
+| bridge | container eth0 -> host veth peer -> docker0 -> host routing/NAT -> host NIC | 기본 격리 제공 |
 | host | process -> host network stack -> host NIC | 경로 단순, 격리 약화 |
 
 ## 9. 정리
@@ -219,10 +242,10 @@ docker run --rm --network host nginx
 
 ```text
 container process
-  -> eth0
-  -> veth pair
+  -> eth0, veth pair의 컨테이너 쪽 endpoint
+  -> host-side veth peer
   -> docker0 bridge
-  -> iptables routing/NAT
+  -> host routing + netfilter NAT
   -> host NIC
 ```
 
